@@ -211,9 +211,13 @@ func (b *Balancer) balance() {
 
 func (b *Balancer) dispatch(req *Request) {
 	w := b.strategy.Next()
-	w.requests <- req
-	atomic.AddUint64(&w.pending, 1)
-	//	fmt.Printf("started %p; now %d\n", w, w.pending)
+	if w == nil {
+		req.ErrorChan <- fmt.Errorf("received worker is nil")
+	} else {
+		w.requests <- req
+		atomic.AddUint64(&w.pending, 1)
+		//	fmt.Printf("started %p; now %d\n", w, w.pending)
+	}
 }
 
 func (b *Balancer) completed(w *Worker) {

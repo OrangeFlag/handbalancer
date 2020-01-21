@@ -17,7 +17,7 @@ func (r *RoundRobinStrategy) Next() *Worker {
 	defer r.poolMutex.RUnlock()
 
 	var worker *Worker
-	for {
+	for i := 0; i < r.pool.Len()*20; i++ {
 		currentIndex := atomic.AddUint64(&r.currentIndex, 1)
 		worker = (*r.pool)[currentIndex%uint64(r.pool.Len())]
 		if circuit, _, _ := hystrix.GetCircuit(worker.name); circuit.AllowRequest() {
@@ -30,5 +30,6 @@ func (r *RoundRobinStrategy) Next() *Worker {
 func (r *RoundRobinStrategy) SetPool(pool *Pool) {
 	r.poolMutex.Lock()
 	defer r.poolMutex.Unlock()
-	r.pool = pool;
+	r.currentIndex = 0
+	r.pool = pool
 }
