@@ -1,23 +1,22 @@
-package lb
+package handbalancer
 
 import (
 	"errors"
 	"fmt"
+	"github.com/OrangeFlag/handbalancer/model"
+	"github.com/OrangeFlag/handbalancer/strategy"
 	"github.com/afex/hystrix-go/hystrix"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
 
-type runFunc func() (interface{}, error)
-type fallbackFunc func(error) (interface{}, error)
-
 type Balancer struct {
 	name      string
-	pool      Pool
-	requests  chan *Request
-	done      chan *Worker
-	strategy  LoadBalancingStrategy
+	pool      model.Pool
+	requests  chan *model.Request
+	done      chan *model.Worker
+	strategy  strategy.LoadBalancingStrategy
 	poolMutex sync.Mutex
 }
 
@@ -31,12 +30,16 @@ func init() {
 	balancers = make(map[string]*Balancer)
 }
 
-func NewBalancer(name string, strategy LoadBalancingStrategy) *Balancer {
+func NewBalancer(name string, strategy strategy.LoadBalancingStrategy) *Balancer {
+	return NewBalancerL(name, strategy, 100)
+}
+
+func NewBalancerL(name string, strategy strategy.LoadBalancingStrategy, chanLen int) *Balancer {
 	b := &Balancer{
 		name:     name,
-		pool:     make(Pool, 0),
-		requests: make(chan *Request),
-		done:     make(chan *Worker),
+		pool:     make(model.Pool, 0),
+		requests: make(chan *model.Request, chanLen),
+		done:     make(chan *model.Worker, chanLen),
 		strategy: strategy,
 	}
 	b.balance()
@@ -60,40 +63,6 @@ func GetBalancer(name string) (*Balancer, error) {
 	}
 }
 
-type Worker struct {
-	name      string
-	idx       uint64
-	requests  chan *Request
-	pending   uint64
-	performer func(interface{}) (interface{}, error)
-}
-
-type Request struct {
-	Func       runFunc
-	ResultChan chan interface{}
-	ErrorChan  chan error
-}
-
-func (w *Worker) work(done chan *Worker) {
-	for {
-		req := <-w.requests
-		if valueF, err := req.Func(); err == nil {
-			if valueP, err := w.performer(valueF); err == nil {
-				req.ResultChan <- valueP
-			} else {
-				req.ErrorChan <- err
-			}
-		} else {
-			req.ErrorChan <- err
-		}
-		done <- w
-	}
-}
-
-type Pool []*Worker
-
-func (p Pool) Len() int { return len(p) }
-
 type CircuitBreakerConfig struct {
 	// Timeout is how long to wait for command to bitcoinMininode, in milliseconds
 	Timeout int
@@ -111,8 +80,24 @@ func (b *Balancer) AddPerformer(name string, performer func(interface{}) (interf
 	b.AddPerformerFCN(name, performer, nil, nil, 1)
 }
 
+func (b *Balancer) AddPerformerN(name string, performer func(interface{}) (interface{}, error), count int) {
+	b.AddPerformerFCN(name, performer, nil, nil, count)
+}
+
+func (b *Balancer) AddPerformerNL(name string, performer func(interface{}) (interface{}, error), count int, chanLen int) {
+	b.AddPerformerFCNL(name, performer, nil, nil, count, chanLen)
+}
+
 func (b *Balancer) AddPerformerC(name string, performer func(interface{}) (interface{}, error), circuitBreakerConfig *CircuitBreakerConfig) {
 	b.AddPerformerFCN(name, performer, nil, circuitBreakerConfig, 1)
+}
+
+func (b *Balancer) AddPerformerCL(name string, performer func(interface{}) (interface{}, error), circuitBreakerConfig *CircuitBreakerConfig, chanLen int) {
+	b.AddPerformerFCNL(name, performer, nil, circuitBreakerConfig, 1, chanLen)
+}
+
+func (b *Balancer) AddPerformerCN(name string, performer func(interface{}) (interface{}, error), circuitBreakerConfig *CircuitBreakerConfig, count int) {
+	b.AddPerformerFCN(name, performer, nil, circuitBreakerConfig, count)
 }
 
 func (b *Balancer) AddPerformerFC(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig) {
@@ -120,6 +105,10 @@ func (b *Balancer) AddPerformerFC(name string, performer func(interface{}) (inte
 }
 
 func (b *Balancer) AddPerformerFCN(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig, count int) {
+	b.AddPerformerFCNL(name, performer, fallback, circuitBreakerConfig, count, 100)
+}
+
+func (b *Balancer) AddPerformerFCNL(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig, count int, chanLen int) {
 	b.poolMutex.Lock()
 	defer b.poolMutex.Unlock()
 
@@ -136,7 +125,7 @@ func (b *Balancer) AddPerformerFCN(name string, performer func(interface{}) (int
 			ErrorPercentThreshold:  25,
 		})
 	}
-	pool := make([]*Worker, b.pool.Len()+count)
+	pool := make([]*model.Worker, b.pool.Len()+count)
 
 	copy(pool, b.pool)
 
@@ -161,12 +150,12 @@ func (b *Balancer) AddPerformerFCN(name string, performer func(interface{}) (int
 	}
 
 	for i := b.pool.Len(); i < b.pool.Len()+count; i++ {
-		w := &Worker{
-			name:      performerName,
-			requests:  make(chan *Request),
-			performer: performerHystrix}
+		w := &model.Worker{
+			Name:      performerName,
+			Requests:  make(chan *model.Request, chanLen),
+			Performer: performerHystrix}
 		pool[i] = w
-		go w.work(b.done)
+		go w.Work(b.done)
 	}
 
 	b.pool = pool
@@ -196,39 +185,26 @@ func (b *Balancer) balance() {
 	go b.balanceCompleted()
 }
 
-//func (b *Balancer) print() {
-//	sum := 0
-//	sumsq := 0
-//	for _, w := range b.pool {
-//		fmt.Printf("%d ", w.pending)
-//		sum += w.pending
-//		sumsq += w.pending * w.pending
-//	}
-//	avg := float64(sum) / float64(len(b.pool))
-//	variance := float64(sumsq)/float64(len(b.pool)) - avg*avg
-//	fmt.Printf(" %.2f %.2f\n", avg, variance)
-//}
-
-func (b *Balancer) dispatch(req *Request) {
+func (b *Balancer) dispatch(req *model.Request) {
 	w := b.strategy.Next()
 	if w == nil {
 		req.ErrorChan <- fmt.Errorf("received worker is nil")
 	} else {
-		w.requests <- req
-		atomic.AddUint64(&w.pending, 1)
-		//	fmt.Printf("started %p; now %d\n", w, w.pending)
+		w.Requests <- req
+		atomic.AddUint64(&w.Pending, 1)
+		//	fmt.Printf("started %p; now %d\n", w, w.Pending)
 	}
 }
 
-func (b *Balancer) completed(w *Worker) {
-	atomic.AddUint64(&w.pending, ^uint64(0))
+func (b *Balancer) completed(w *model.Worker) {
+	atomic.AddUint64(&w.Pending, ^uint64(0))
 }
 
-func Do(name string, run runFunc) (interface{}, error) {
+func Do(name string, run model.RunFunc) (interface{}, error) {
 	return doF(name, run, nil)
 }
 
-func doF(name string, run runFunc, fallback fallbackFunc) (interface{}, error) {
+func doF(name string, run model.RunFunc, fallback model.FallbackFunc) (interface{}, error) {
 	resultChan, errChan := goF(name, run, fallback)
 
 	select {
@@ -239,11 +215,11 @@ func doF(name string, run runFunc, fallback fallbackFunc) (interface{}, error) {
 	}
 }
 
-func Go(name string, run runFunc) (chan interface{}, chan error) {
+func Go(name string, run model.RunFunc) (chan interface{}, chan error) {
 	return goF(name, run, nil)
 }
 
-func goF(name string, run runFunc, fallback fallbackFunc) (chan interface{}, chan error) {
+func goF(name string, run model.RunFunc, fallback model.FallbackFunc) (chan interface{}, chan error) {
 	balancer, err := GetBalancer(name)
 
 	errChan := make(chan error, 3)
@@ -271,7 +247,7 @@ func goF(name string, run runFunc, fallback fallbackFunc) (chan interface{}, cha
 
 	resultChan := make(chan interface{})
 
-	balancer.requests <- &Request{
+	balancer.requests <- &model.Request{
 		Func:       handler,
 		ResultChan: resultChan,
 		ErrorChan:  errChan,
