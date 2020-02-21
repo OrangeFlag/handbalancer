@@ -76,56 +76,27 @@ type CircuitBreakerConfig struct {
 	ErrorPercentThreshold int
 }
 
-func (b *Balancer) AddPerformer(name string, performer func(interface{}) (interface{}, error)) {
-	b.AddPerformerFCN(name, performer, nil, nil, 1)
+func (b *Balancer) AddPerformer(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig) {
+	b.AddPerformerW(name, performer, fallback, circuitBreakerConfig, 1)
 }
 
-func (b *Balancer) AddPerformerN(name string, performer func(interface{}) (interface{}, error), count int) {
-	b.AddPerformerFCN(name, performer, nil, nil, count)
-}
-
-func (b *Balancer) AddPerformerNL(name string, performer func(interface{}) (interface{}, error), count int, chanLen int) {
-	b.AddPerformerFCNL(name, performer, nil, nil, count, chanLen)
-}
-
-func (b *Balancer) AddPerformerC(name string, performer func(interface{}) (interface{}, error), circuitBreakerConfig *CircuitBreakerConfig) {
-	b.AddPerformerFCN(name, performer, nil, circuitBreakerConfig, 1)
-}
-
-func (b *Balancer) AddPerformerCL(name string, performer func(interface{}) (interface{}, error), circuitBreakerConfig *CircuitBreakerConfig, chanLen int) {
-	b.AddPerformerFCNL(name, performer, nil, circuitBreakerConfig, 1, chanLen)
-}
-
-func (b *Balancer) AddPerformerCN(name string, performer func(interface{}) (interface{}, error), circuitBreakerConfig *CircuitBreakerConfig, count int) {
-	b.AddPerformerFCN(name, performer, nil, circuitBreakerConfig, count)
-}
-
-func (b *Balancer) AddPerformerFC(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig) {
-	b.AddPerformerFCN(name, performer, fallback, circuitBreakerConfig, 1)
-}
-
-func (b *Balancer) AddPerformerFCN(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig, count int) {
-	b.AddPerformerFCNL(name, performer, fallback, circuitBreakerConfig, count, 100)
-}
-
-func (b *Balancer) AddPerformerFCNL(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig, count int, chanLen int) {
+func (b *Balancer) AddPerformerW(name string, performer func(interface{}) (interface{}, error), fallback func(error) error, circuitBreakerConfig *CircuitBreakerConfig, weight int) {
 	b.poolMutex.Lock()
 	defer b.poolMutex.Unlock()
 
 	performerName := strings.Join([]string{b.name, name}, "-")
 
-	if circuitBreakerConfig != nil {
-		hystrix.ConfigureCommand(performerName, hystrix.CommandConfig(*circuitBreakerConfig))
-	} else {
-		hystrix.ConfigureCommand(performerName, hystrix.CommandConfig{
+	if circuitBreakerConfig == nil {
+		circuitBreakerConfig = &CircuitBreakerConfig{
 			Timeout:                10000,
 			MaxConcurrentRequests:  100,
 			RequestVolumeThreshold: 5,
 			SleepWindow:            5000,
 			ErrorPercentThreshold:  25,
-		})
+		}
 	}
-	pool := make([]*model.Worker, b.pool.Len()+count)
+	hystrix.ConfigureCommand(performerName, hystrix.CommandConfig(*circuitBreakerConfig))
+	pool := make([]*model.Worker, b.pool.Len()+weight)
 
 	copy(pool, b.pool)
 
@@ -149,10 +120,10 @@ func (b *Balancer) AddPerformerFCNL(name string, performer func(interface{}) (in
 		}
 	}
 
-	for i := b.pool.Len(); i < b.pool.Len()+count; i++ {
+	for i := b.pool.Len(); i < b.pool.Len()+weight; i++ {
 		w := &model.Worker{
 			Name:      performerName,
-			Requests:  make(chan *model.Request, chanLen),
+			Requests:  make(chan *model.Request, circuitBreakerConfig.MaxConcurrentRequests/weight*2),
 			Performer: performerHystrix}
 		pool[i] = w
 		go w.Work(b.done)
@@ -200,12 +171,8 @@ func (b *Balancer) completed(w *model.Worker) {
 	atomic.AddUint64(&w.Pending, ^uint64(0))
 }
 
-func Do(name string, run model.RunFunc) (interface{}, error) {
-	return doF(name, run, nil)
-}
-
-func doF(name string, run model.RunFunc, fallback model.FallbackFunc) (interface{}, error) {
-	resultChan, errChan := goF(name, run, fallback)
+func Do(name string, run model.RunFunc, fallback model.FallbackFunc) (interface{}, error) {
+	resultChan, errChan := Go(name, run, fallback)
 
 	select {
 	case result := <-resultChan:
@@ -215,11 +182,7 @@ func doF(name string, run model.RunFunc, fallback model.FallbackFunc) (interface
 	}
 }
 
-func Go(name string, run model.RunFunc) (chan interface{}, chan error) {
-	return goF(name, run, nil)
-}
-
-func goF(name string, run model.RunFunc, fallback model.FallbackFunc) (chan interface{}, chan error) {
+func Go(name string, run model.RunFunc, fallback model.FallbackFunc) (chan interface{}, chan error) {
 	balancer, err := GetBalancer(name)
 
 	errChan := make(chan error, 3)
